@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+torch
+transformers
+sentence-transformers
+faiss-cpu
+spacy
+pydantic
+python-multipart
