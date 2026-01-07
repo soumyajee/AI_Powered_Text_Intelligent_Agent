@@ -3,7 +3,7 @@ import faiss
 import numpy as np
 import json
 from threading import Lock
-from typing import List
+from typing import List, Dict, Any
 from app.config import VECTOR_DIM
 from app.service.embeddings import embed
 
@@ -25,13 +25,28 @@ _lock = Lock()
 # -----------------------------
 # Helper functions
 # -----------------------------
-def _load_index() -> faiss.IndexFlatL2:
+def _load_index() -> faiss.Index:
+    """
+    Use cosine similarity by:
+      - IndexFlatIP (inner product)
+      - L2-normalize vectors before add/search
+    With normalization, returned scores are cosine similarity in [-1, 1]
+    and will NOT exceed 1.
+    """
     if os.path.exists(INDEX_PATH):
-        return faiss.read_index(INDEX_PATH)
-    else:
-        return faiss.IndexFlatL2(VECTOR_DIM)
+        idx = faiss.read_index(INDEX_PATH)
 
-def _save_index(index: faiss.IndexFlatL2) -> None:
+        # Safety: if an old L2 index exists, it will give distances, not cosine.
+        # You should rebuild once if you changed index type.
+        if not isinstance(idx, faiss.IndexFlatIP):
+            raise RuntimeError(
+                "Existing index is not IndexFlatIP. Delete data/faiss.index and rebuild."
+            )
+        return idx
+
+    return faiss.IndexFlatIP(VECTOR_DIM)
+
+def _save_index(index: faiss.Index) -> None:
     faiss.write_index(index, INDEX_PATH)
 
 def _load_documents() -> List[str]:
@@ -42,40 +57,42 @@ def _load_documents() -> List[str]:
 
 def _save_documents(docs: List[str]) -> None:
     with open(DOCS_PATH, "w", encoding="utf-8") as f:
-        json.dump(docs, f)
+        json.dump(docs, f, ensure_ascii=False)
+
+def _embed_np(text: str) -> np.ndarray:
+    vec = embed(text)
+    if len(vec) != VECTOR_DIM:
+        raise ValueError(f"Embedding dimension mismatch: expected {VECTOR_DIM}, got {len(vec)}")
+    arr = np.array([vec], dtype="float32")  # shape (1, dim)
+    # IMPORTANT: normalize so inner product == cosine similarity
+    faiss.normalize_L2(arr)
+    return arr
 
 # -----------------------------
 # Add document
 # -----------------------------
 def add_document(text: str) -> None:
-    vector = embed(text)
-    if len(vector) != VECTOR_DIM:
-        raise ValueError(f"Embedding dimension mismatch: expected {VECTOR_DIM}, got {len(vector)}")
-
-    vector_np = np.array([vector], dtype="float32")
+    vector_np = _embed_np(text)
 
     with _lock:
-        # Load current state
         index = _load_index()
         documents = _load_documents()
 
-        # Add new vector and document
         index.add(vector_np)
         documents.append(text)
 
-        # Save back
         _save_index(index)
         _save_documents(documents)
 
 # -----------------------------
-# Semantic search
+# Semantic search (returns cosine scores, never > 1)
 # -----------------------------
-def search_similar(query: str, top_k: int = 5) -> List[str]:
-    vector = embed(query)
-    if len(vector) != VECTOR_DIM:
-        raise ValueError(f"Embedding dimension mismatch: expected {VECTOR_DIM}, got {len(vector)}")
-
-    vector_np = np.array([vector], dtype="float32")
+def search_similar(query: str, top_k: int = 5, min_score: float = 0.75) -> List[Dict[str, Any]]:
+    """
+    Returns list of {"text": ..., "score": ...}
+    score is cosine similarity in [-1, 1] and will not exceed 1.
+    """
+    query_np = _embed_np(query)
 
     with _lock:
         index = _load_index()
@@ -84,11 +101,36 @@ def search_similar(query: str, top_k: int = 5) -> List[str]:
 
         documents = _load_documents()
         k = min(top_k, index.ntotal)
-        distances, indices = index.search(vector_np, k)
 
-        results = []
-        for i in indices[0]:
-            if i != -1 and i < len(documents):  # -1 can appear if k > ntotal
-                results.append(documents[i])
+        scores, indices = index.search(query_np, k)  # cosine similarities
+
+        results: List[Dict[str, Any]] = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx == -1 or idx >= len(documents):
+                continue
+
+            score_f = float(score)
+            if score_f < min_score:
+                continue
+
+            results.append({"text": documents[idx], "score": score_f})
 
         return results
+
+# -----------------------------
+# Optional: one-time rebuild helper (run once after deleting old L2 index)
+# -----------------------------
+def rebuild_index_from_docs() -> None:
+    """
+    If you previously used IndexFlatL2, do this once:
+      1) delete data/faiss.index
+      2) call rebuild_index_from_docs()
+    """
+    docs = _load_documents()
+    index = faiss.IndexFlatIP(VECTOR_DIM)
+
+    for d in docs:
+        v = _embed_np(d)  # normalized
+        index.add(v)
+
+    _save_index(index)
